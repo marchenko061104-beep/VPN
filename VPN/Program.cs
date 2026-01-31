@@ -1,14 +1,17 @@
+using H.OpenVpn;
+using SharpPcap;
+using SharpPcap.LibPcap;
 using System;
 using System.Data;
+using System.Diagnostics;
 using System.Net;
 using System.Net.Sockets;
+using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading.Tasks;
-using SharpPcap;
-using System.Diagnostics;
-using System.Runtime.InteropServices;
+using TapTunHelperCsharp;
 
-namespace VPN
+namespace VPN_s
 {
     class Program
     {
@@ -16,8 +19,7 @@ namespace VPN
         static TcpClient client = null;
         static bool isRunning = false;
         static string secretPassword = "VaPN123";
-
-
+        static IntPtr tunHandle = IntPtr.Zero;
 
         static byte[] EncryptData(byte[] data)
         {
@@ -31,19 +33,15 @@ namespace VPN
             return result;
         }//шифрирование
 
-
         static byte[] DecryptData(byte[] data)
         {
             return EncryptData(data);
-
         }//дешифрирование
-
 
         static void SetupVpnRouting(string vpnServerIp)
         {
             try
             {
-                Console.WriteLine("\n🔧 Настраиваю маршрутизацию и DNS...");
                 Console.WriteLine("🇩🇪 Устанавливаю DNS 9.9.9.9 (Франкфурт)...");
 
                 Process.Start(new ProcessStartInfo
@@ -55,7 +53,6 @@ namespace VPN
                     CreateNoWindow = true
                 });
 
-                // МАРШРУТИЗАЦИЯ (оставляем как было)
                 Process.Start(new ProcessStartInfo
                 {
                     FileName = "cmd.exe",
@@ -71,8 +68,181 @@ namespace VPN
             {
                 Console.WriteLine("⚠️ Запусти программу от имени Администратора!");
             }
-        }
+        }//маршрутизация
 
+     
+        static bool ConfigureTunAdapter()
+        {
+            try
+            {
+                Console.WriteLine("🔧 Настраиваю TUN адаптер...");
+                Process.Start(new ProcessStartInfo
+                {
+                    FileName = "netsh",
+                    Arguments = "interface ip set address name=\"Ethernet\" static 10.8.0.1 255.255.255.0",
+                    Verb = "runas",
+                    UseShellExecute = true,
+                    CreateNoWindow = true
+                });
+
+                Console.WriteLine("✅ TUN адаптер настроен с IP 10.8.0.1");
+                return true;
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"❌ Ошибка настройки TUN: {ex.Message}");
+                return false;
+            }
+        }//настройка адаптера
+
+
+
+        static string AnalyzePacket(byte[] packet)
+        {
+            if (packet.Length < 20)
+                return $"Маленький пакет: {packet.Length} байт";
+
+            try
+            {
+                byte version = (byte)(packet[0] >> 4);
+                byte ihl = (byte)(packet[0] & 0x0F);
+                byte protocol = packet[9];
+
+                string srcIp = $"{packet[12]}.{packet[13]}.{packet[14]}.{packet[15]}";
+                string dstIp = $"{packet[16]}.{packet[17]}.{packet[18]}.{packet[19]}";
+
+                string protocolName = protocol switch
+                {
+                    6 => "TCP",
+                    17 => "UDP",
+                    1 => "ICMP",
+                    58 => "ICMPv6",
+                    _ => $"Протокол {protocol}"
+                };
+
+                return $"{srcIp} → {dstIp} ({protocolName}): {packet.Length} байт";
+            }
+            catch
+            {
+                return $"Неизвестный пакет: {packet.Length} байт";
+            }
+        }//анализ пакета
+
+        static async Task CaptureRealTraffic(NetworkStream vpnStream)
+        {
+            byte[] buffer = new byte[65535];
+            Console.WriteLine("📡 Начинаю перехват трафика через TUN...");
+
+            while (isRunning && tunHandle != IntPtr.Zero && client?.Connected == true)
+            {
+                try
+                {
+                    if (tunHandle == IntPtr.Zero || tunHandle.ToInt32() == -1)
+                    {
+                        Console.WriteLine("⚠️ TUN адаптер закрыт, останавливаю захват...");
+                        break;
+                    }
+                    uint bytesRead = 0;
+                    if (ReadFile(tunHandle, buffer, (uint)buffer.Length, out bytesRead, IntPtr.Zero))
+                    {
+                        if (bytesRead > 0)
+                        {
+                            byte[] packet = new byte[bytesRead];
+                            Array.Copy(buffer, packet, bytesRead);
+                            string packetInfo = AnalyzePacket(packet);
+                            Console.WriteLine($"📦 {packetInfo}");
+                            await SendToVpnServer(packet, vpnStream);
+                        }
+                        else
+                        {
+                            await Task.Delay(50);
+                        }
+                    }
+                    else
+                    {
+                        int error = Marshal.GetLastWin32Error();
+                        if (error == 997) 
+                        {
+                            await Task.Delay(50);
+                        }
+                        else if (error != 0)
+                        {
+                            Console.WriteLine($" Ошибка чтения TUN (код {error})");
+                            await Task.Delay(100);
+                        }
+                    }
+
+                    await Task.Delay(10);
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($" Ошибка захвата трафика: {ex.Message}");
+                    await Task.Delay(100);
+                }
+            }
+
+            Console.WriteLine("Захват трафика остановлен");
+        }//перехват трафика
+
+        static async Task SendToVpnServer(byte[] packet, NetworkStream stream)
+        {
+            try
+            {
+                byte[] encrypted = EncryptData(packet);
+                await stream.WriteAsync(encrypted, 0, encrypted.Length);
+            }
+            catch { }
+        }//отправка пакетов
+
+        static async Task SendToTun(byte[] packet)
+        {
+            if (tunHandle == IntPtr.Zero || packet == null || packet.Length == 0)
+                return;
+
+            try
+            {
+                if (tunHandle.ToInt32() == -1)
+                {
+                    Console.WriteLine("TUN адаптер закрыт, не могу отправить пакет");
+                    return;
+                }
+                uint bytesWritten = 0;
+                if (WriteFile(tunHandle, packet, (uint)packet.Length, out bytesWritten, IntPtr.Zero))
+                {
+                    if (bytesWritten > 0)
+                    {
+                        if (packet.Length >= 20)
+                        {
+                            byte protocol = packet[9];
+                            string protocolName = protocol switch
+                            {
+                                6 => "TCP",
+                                17 => "UDP",
+                                1 => "ICMP",
+                                _ => $"Протокол {protocol}"
+                            };
+                            Console.WriteLine($"Получен {protocolName} пакет: {bytesWritten} байт");
+                        }
+                        else
+                        {
+                            Console.WriteLine($" Получено данных: {bytesWritten} байт");
+                        }
+                    }
+                }
+                else
+                {
+                    int error = Marshal.GetLastWin32Error();
+                    if (error != 0)
+                    {
+                        Console.WriteLine($"Не удалось записать в TUN (ошибка {error})");
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"❌ Ошибка отправки в TUN: {ex.Message}");
+            }
+        }//отправка в tun
 
         static async Task Main(string[] args)
         {
@@ -80,18 +250,17 @@ namespace VPN
 
             while (true)
             {
-                Console.WriteLine("=== VPN (ТЕСТ на одном компьютере) ===");
-                Console.WriteLine("1. Подключиться");
+                Console.WriteLine("=== VPN (ТЕСТ на одном компьютере)ав120020 ===");
+                Console.WriteLine("1. Подключиться выаываы");
                 Console.WriteLine("2. Отключиться");
                 Console.Write("Выбор: ");
                 var choice = Console.ReadLine();
 
                 if (choice == "1" && !isRunning)
                 {
-                    //Л МАРШРУТИЗАЦИЮ 
-                    SetupVpnRouting(localIp);
-
+                    SetupVpnRouting(localIp); //маршрутизация
                     _ = Task.Run(async () => await RunServer());
+                    await Task.Delay(1000);
                     _ = Task.Run(async () => await RunClient(localIp));
 
                     isRunning = true;
@@ -134,19 +303,22 @@ namespace VPN
             {
                 try
                 {
-                    // Ждем данные от клиента
                     int bytesRead = await stream.ReadAsync(buffer, 0, buffer.Length);
                     if (bytesRead == 0) break;
-
-                    // Берем только полученные байты
                     byte[] receivedData = new byte[bytesRead];
                     Array.Copy(buffer, receivedData, bytesRead);
-
-                    // ДЕШИФРУЕМ
                     byte[] decryptedData = DecryptData(receivedData);
-                    string message = Encoding.UTF8.GetString(decryptedData);
-
-                    Console.WriteLine($"Сервер получил: '{message}'");
+                    if (bytesRead > 100)
+                    {
+                        string packetInfo = AnalyzePacket(decryptedData);
+                        Console.WriteLine($"Сервер получил: {packetInfo}");
+                        await stream.WriteAsync(receivedData, 0, receivedData.Length);
+                    }
+                    else
+                    {
+                        string message = Encoding.UTF8.GetString(decryptedData);
+                        Console.WriteLine($"Сервер получил: '{message}'");
+                    }
                 }
                 catch
                 {
@@ -155,84 +327,70 @@ namespace VPN
             }
         }
 
-        // 🔥 ПРОСТО ПОДКЛЮЧАЕМСЯ К localhost
         static async Task RunClient(string vpnServerIp)
         {
             client = new TcpClient();
             await client.ConnectAsync(vpnServerIp, 2222);
-            Console.WriteLine("Клиент: подключился к серверу");
+            Console.WriteLine("Успешное подключение к VPN");
 
-            NetworkStream stream = client.GetStream();
-            byte[] buffer = new byte[4096];
+            NetworkStream vpnStream = client.GetStream();
+            byte[] buffer = new byte[65535];
+            Task tunCaptureTask = Task.Run(() => CaptureRealTraffic(vpnStream));
 
-
-            string[] testTraffic = {
-                "Привет!",                    // 1. Просто текст
-                "GET / HTTP/1.1",             // 2. HTTP запрос (как браузер)
-                "user@mail.com:pass123",      // 3. Логин/пароль
-                "8.8.8.8",                    // 4. DNS запрос
-                "🎥 Видео поток"              // 5. Юникод (как медиа)
-            };
-
-            foreach (var data in testTraffic)
-            {
-                Console.WriteLine($"\nКлиент отправляет: '{data}'");
-
-                //  ШИФРУЕМ данные
-                byte[] encrypted = EncryptData(Encoding.UTF8.GetBytes(data));
-
-                //  ОТПРАВЛЯЕМ зашифрованные данные
-                await stream.WriteAsync(encrypted, 0, encrypted.Length);
-
-                // ЖДЕМ ОТВЕТ от сервера
-
-                if (stream.DataAvailable)
-                {
-                    int bytesRead = await stream.ReadAsync(buffer, 0, buffer.Length);
-                    if (bytesRead > 0)
-                    {
-                        byte[] receivedData = new byte[bytesRead];
-                        Array.Copy(buffer, receivedData, bytesRead);
-
-                        // ДЕШИФРУЕМ ответ
-                        byte[] decryptedData = DecryptData(receivedData);
-                        string response = Encoding.UTF8.GetString(decryptedData);
-
-                        Console.WriteLine($"Ответ сервера: '{response}'");
-                    }
-                }
-                await Task.Delay(1000);
-            }
-
-            while (isRunning)
+            while (isRunning && client.Connected)
             {
                 try
                 {
-                    // Клиент тоже может получать сообщения
-                    int bytesRead = await stream.ReadAsync(buffer, 0, buffer.Length);
-                    if (bytesRead == 0) break;
-
-                    byte[] receivedData = new byte[bytesRead];
-                    Array.Copy(buffer, receivedData, bytesRead);
-
-                    Console.WriteLine($"\nКлиент получил: {BitConverter.ToString(receivedData)}");
-
-                    // Дешифруем
-                    byte[] decryptedData = DecryptData(receivedData);
-                    string message = Encoding.UTF8.GetString(decryptedData);
-
-                    Console.WriteLine($"Сообщение: '{message}'");
+                    if (vpnStream.DataAvailable)
+                    {
+                        int bytesRead = await vpnStream.ReadAsync(buffer, 0, buffer.Length);
+                        if (bytesRead > 0)
+                        {
+                            byte[] receivedData = new byte[bytesRead];
+                            Array.Copy(buffer, receivedData, bytesRead);
+                            byte[] decryptedResponse = DecryptData(receivedData);
+                            await SendToTun(decryptedResponse);
+                        }
+                    }
+                    await Task.Delay(10);
                 }
-                catch
+                catch (Exception ex)
                 {
-                    break;
+                    if (isRunning)
+                    {
+                        Console.WriteLine($" Ошибка приема: {ex.Message}");
+                        break;
+                    }
                 }
             }
+            await tunCaptureTask;
         }
 
         static void Disconnect()
         {
             isRunning = false;
+
+            try
+            {
+                Process.Start(new ProcessStartInfo
+                {
+                    FileName = "netsh",
+                    Arguments = "interface ip set dns name=\"Ethernet\" dhcp",
+                    Verb = "runas",
+                    UseShellExecute = true,
+                    CreateNoWindow = true
+                });
+                Console.WriteLine(" DNS восстановлен на автоматический");
+            }
+            catch { }
+
+            // Закрываем TUN если открыт
+            if (tunHandle != IntPtr.Zero)
+            {
+                CloseHandle(tunHandle);
+                tunHandle = IntPtr.Zero;
+                Console.WriteLine(" TUN закрыт");
+            }
 
             if (client != null)
             {
@@ -245,8 +403,25 @@ namespace VPN
                 server.Stop();
                 server = null;
             }
-
+            Console.WriteLine("fdgdfg");
             Console.WriteLine("\n=== вы отключились ===");
         }
+
+        // =========== WINAPI ФУНКЦИИ ДЛЯ TUN ===========
+        [DllImport("kernel32.dll", SetLastError = true)]
+        static extern IntPtr CreateFile(string lpFileName, uint dwDesiredAccess,
+            uint dwShareMode, IntPtr lpSecurityAttributes, uint dwCreationDisposition,
+            uint dwFlagsAndAttributes, IntPtr hTemplateFile);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        static extern bool ReadFile(IntPtr hFile, byte[] lpBuffer,
+            uint nNumberOfBytesToRead, out uint lpNumberOfBytesRead, IntPtr lpOverlapped);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        static extern bool WriteFile(IntPtr hFile, byte[] lpBuffer,
+            uint nNumberOfBytesToWrite, out uint lpNumberOfBytesWritten, IntPtr lpOverlapped);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        static extern bool CloseHandle(IntPtr hObject);
     }
 }
